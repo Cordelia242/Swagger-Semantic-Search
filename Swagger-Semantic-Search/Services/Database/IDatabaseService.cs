@@ -12,13 +12,15 @@ public interface IDatabaseService
         int serviceId
     );
 
-    public Task BulkInsertAsync(IEnumerable<Document> documents, int serviceId, CancellationToken cancellationToken = default);
+    public Task BulkInsertAsync(
+        IEnumerable<Document> documents,
+        int serviceId,
+        CancellationToken cancellationToken = default
+    );
 
     public IAsyncEnumerable<Document> SearchByDescriptionAsync(
         float[] descriptionEmbedding,
-        int serviceId,
-        int limit = 5,
-        int? groupId = null // Added optional groupId
+        int limit = 5
     );
     public void SeedDatabase();
     public Task<int> GetOrCreateGroupAsync(string groupName);

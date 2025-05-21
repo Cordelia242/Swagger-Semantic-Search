@@ -17,18 +17,31 @@ public class SwaggerController(
     [HttpPost("scan")]
     public async Task<IActionResult> Scan([FromBody] SwaggerControllerScanRequest req)
     {
-        if (string.IsNullOrWhiteSpace(req.Url) || !Uri.TryCreate(req.Url, UriKind.Absolute, out var uriResult) || (uriResult.Scheme != Uri.UriSchemeHttp && uriResult.Scheme != Uri.UriSchemeHttps))
+        if (
+            string.IsNullOrWhiteSpace(req.Url)
+            || !Uri.TryCreate(req.Url, UriKind.Absolute, out var uriResult)
+            || (uriResult.Scheme != Uri.UriSchemeHttp && uriResult.Scheme != Uri.UriSchemeHttps)
+        )
         {
-            return BadRequest(new { message = "Invalid URL format. Please provide an absolute HTTP or HTTPS URL." });
+            return BadRequest(
+                new
+                {
+                    message = "Invalid URL format. Please provide an absolute HTTP or HTTPS URL."
+                }
+            );
         }
 
         // Get or create the group
         var groupId = await databaseService.GetOrCreateGroupAsync(req.GroupName);
 
         // Get or create the service
-        var serviceId = await databaseService.GetOrCreateServiceAsync(req.ServiceName, req.Url, groupId);
+        var serviceId = await databaseService.GetOrCreateServiceAsync(
+            req.ServiceName,
+            req.Url,
+            groupId
+        );
 
-        OpenApiDocument swaggerData;
+        Microsoft.OpenApi.Models.OpenApiDocument swaggerData;
         try
         {
             swaggerData = await swaggerService.GetSwaggerDocumentAsync(req.Url);
@@ -36,12 +49,17 @@ public class SwaggerController(
         catch (Exception ex)
         {
             // Log the exception ex here if logging is set up
-            return new ObjectResult(new { message = $"Failed to fetch or parse Swagger document from the provided URL. Details: {ex.Message}" })
+            return new ObjectResult(
+                new
+                {
+                    message = $"Failed to fetch or parse Swagger document from the provided URL. Details: {ex.Message}"
+                }
+            )
             {
                 StatusCode = StatusCodes.Status422UnprocessableEntity
             };
         }
-        
+
         var operationsToEmbed = new List<(string OperationPathKey, string Description)>();
 
         foreach (var pathItemPair in swaggerData.Paths) // pathItemPair is KeyValuePair<string, OpenApiPathItem>
@@ -68,16 +86,20 @@ public class SwaggerController(
         // Then, extract descriptions for bulk embedding:
         var descriptionsToEmbed = operationsToEmbed.Select(o => o.Description).ToArray();
         // embeddings is Dictionary<string, float[]> where string is the description
-        var embeddings = await embeddingService.BulkConversion(descriptionsToEmbed); 
+        var embeddings = await embeddingService.BulkConversion(descriptionsToEmbed);
 
         // Then, create Document entities:
-        List<Document> documents = operationsToEmbed.Select(opInfo => new Document
-        {
-            Embedding = embeddings.TryGetValue(opInfo.Description, out var embedding) ? embedding : Array.Empty<float>(), // Handle case where description might not be in embeddings dictionary, though it should be.
-            Description = opInfo.Description,
-            Path = opInfo.OperationPathKey // This is now "GET /path"
-        }).ToList();
-        
+        List<Document> documents = operationsToEmbed
+            .Select(opInfo => new Document
+            {
+                Embedding = embeddings.TryGetValue(opInfo.Description, out var embedding)
+                    ? embedding
+                    : Array.Empty<float>(), // Handle case where description might not be in embeddings dictionary, though it should be.
+                Description = opInfo.Description,
+                Path = opInfo.OperationPathKey // This is now "GET /path"
+            })
+            .ToList();
+
         // Filter out documents with empty embeddings if necessary, though BulkConversion should ideally handle all provided descriptions.
         documents = documents.Where(d => d.Embedding.Length > 0).ToList();
 
@@ -94,21 +116,8 @@ public class SwaggerController(
     [HttpPost("search")]
     public async Task<IActionResult> Search([FromBody] SwaggerControllerSearchRequest req)
     {
-        int? groupId = null;
-        if (!string.IsNullOrEmpty(req.GroupName))
-        {
-            groupId = await databaseService.GetGroupIdByNameAsync(req.GroupName);
-            if (!groupId.HasValue)
-            {
-                return NotFound(new { message = $"Group '{req.GroupName}' not found." });
-            }
-        }
-
         var embedding = await embeddingService.ConvertTextToEmbedding(req.Description);
-        // Pass serviceId and groupId to SearchByDescriptionAsync
-        // The serviceId from the request is used to filter by a specific service.
-        // The groupId (if provided) is used to filter by a specific group.
-        var results = databaseService.SearchByDescriptionAsync(embedding, req.ServiceId, groupId: groupId);
+        var results = databaseService.SearchByDescriptionAsync(embedding);
 
         List<Document> documents = [];
         await foreach (var document in results)
