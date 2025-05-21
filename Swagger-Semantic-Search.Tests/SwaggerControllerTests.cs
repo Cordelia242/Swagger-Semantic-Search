@@ -42,26 +42,28 @@ public class SwaggerControllerTests
     }
 
     [Fact]
-    public async Task Scan_InvalidUrl_ReturnsBadRequest()
+    public async Task Scan_InvalidSwaggerUiUrl_ReturnsBadRequest()
     {
         // Arrange
-        var request = new SwaggerControllerScanRequest { Url = "invalid-url", GroupName = "TestGroup", ServiceName = "TestService" };
+        var request = new SwaggerControllerScanRequest { SwaggerUiUrl = "invalid-url", GroupName = "TestGroup", ServiceName = "TestService" };
 
         // Act
         var result = await _controller.Scan(request);
 
         // Assert
         var badRequestResult = Assert.IsType<BadRequestObjectResult>(result);
-        Assert.Equal("Invalid URL format. Please provide an absolute HTTP or HTTPS URL.", ((dynamic)badRequestResult.Value).message);
+        Assert.Equal("Invalid Swagger UI URL format. Please provide an absolute HTTP or HTTPS URL.", ((dynamic)badRequestResult.Value).message);
     }
 
     [Fact]
-    public async Task Scan_SwaggerFetchFails_ReturnsUnprocessableEntity()
+    public async Task Scan_DiscoverJsonUrlsFails_ReturnsUnprocessableEntity()
     {
         // Arrange
-        var request = new SwaggerControllerScanRequest { Url = "http://valid-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
-        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(request.Url))
-            .ThrowsAsync(new System.Exception("Fetch failed"));
+        var request = new SwaggerControllerScanRequest { SwaggerUiUrl = "http://valid-ui-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
+        _mockDatabaseService.Setup(db => db.GetOrCreateGroupAsync(request.GroupName)).ReturnsAsync(1);
+        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(request.ServiceName, request.SwaggerUiUrl, 1)).ReturnsAsync(101);
+        _mockSwaggerService.Setup(s => s.DiscoverSwaggerJsonUrlsAsync(request.SwaggerUiUrl))
+            .ThrowsAsync(new System.Exception("Discovery failed"));
 
         // Act
         var result = await _controller.Scan(request);
@@ -69,69 +71,92 @@ public class SwaggerControllerTests
         // Assert
         var objectResult = Assert.IsType<ObjectResult>(result);
         Assert.Equal(StatusCodes.Status422UnprocessableEntity, objectResult.StatusCode);
-        Assert.Contains("Fetch failed", ((dynamic)objectResult.Value).message);
+        Assert.Contains("Discovery failed", ((dynamic)objectResult.Value).message);
     }
-
+    
     [Fact]
-    public async Task Scan_NoOperationsInSwagger_ReturnsOkWithMessage()
+    public async Task Scan_GetSwaggerDocumentFailsForOneUrl_ContinuesAndCanSucceed()
     {
         // Arrange
-        var request = new SwaggerControllerScanRequest { Url = "http://valid-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
-        var swaggerDoc = new OpenApiDocument(); // Empty document
-        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(request.Url))
-            .ReturnsAsync(swaggerDoc);
-        _mockDatabaseService.Setup(db => db.GetOrCreateGroupAsync(It.IsAny<string>())).ReturnsAsync(1);
-        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<int>())).ReturnsAsync(1);
+        var request = new SwaggerControllerScanRequest { SwaggerUiUrl = "http://valid-ui-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
+        var jsonUrls = new List<string> { "http://valid-json-url1.com/swagger.json", "http://failing-json-url2.com/swagger.json", "http://valid-json-url3.com/swagger.json" };
+        
+        _mockDatabaseService.Setup(db => db.GetOrCreateGroupAsync(request.GroupName)).ReturnsAsync(1);
+        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(request.ServiceName, request.SwaggerUiUrl, 1)).ReturnsAsync(101);
+        _mockSwaggerService.Setup(s => s.DiscoverSwaggerJsonUrlsAsync(request.SwaggerUiUrl)).ReturnsAsync(jsonUrls);
 
+        var doc1 = new OpenApiDocument { Paths = new OpenApiPaths { ["/path1"] = new OpenApiPathItem { Operations = new Dictionary<OperationType, OpenApiOperation> { [OperationType.Get] = new OpenApiOperation { Description = "Desc1" } } } } };
+        var doc3 = new OpenApiDocument { Paths = new OpenApiPaths { ["/path3"] = new OpenApiPathItem { Operations = new Dictionary<OperationType, OpenApiOperation> { [OperationType.Post] = new OpenApiOperation { Description = "Desc3" } } } } };
+
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[0])).ReturnsAsync(doc1);
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[1])).ThrowsAsync(new System.Exception("Fetch failed for url2"));
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[2])).ReturnsAsync(doc3);
+        
+        var expectedDescriptions = new[] { "Desc1", "Desc3" };
+        var embeddingsDict = expectedDescriptions.ToDictionary(desc => desc, desc => new[] { 0.1f });
+        _mockEmbeddingService.Setup(e => e.BulkConversion(It.Is<string[]>(descs => descs.SequenceEqual(expectedDescriptions)))).ReturnsAsync(embeddingsDict);
+        
+        List<Document> capturedDocs = null;
+        _mockDatabaseService.Setup(db => db.BulkInsertAsync(It.IsAny<IEnumerable<Document>>(), 101, It.IsAny<CancellationToken>()))
+            .Callback<IEnumerable<Document>, int, CancellationToken>((docs, id, token) => capturedDocs = docs.ToList())
+            .Returns(Task.CompletedTask);
 
         // Act
         var result = await _controller.Scan(request);
 
         // Assert
         var okResult = Assert.IsType<OkObjectResult>(result);
-        Assert.Equal("No operations with descriptions found to scan.", ((dynamic)okResult.Value).message);
+        Assert.Contains($"Data scanned and saved successfully from {jsonUrls.Count} Swagger definition(s). Processed {expectedDescriptions.Length} operations.", ((dynamic)okResult.Value).message);
+        Assert.NotNull(capturedDocs);
+        Assert.Equal(2, capturedDocs.Count);
+        Assert.Contains(capturedDocs, d => d.Description == "Desc1");
+        Assert.Contains(capturedDocs, d => d.Description == "Desc3");
+    }
+
+
+    [Fact]
+    public async Task Scan_NoOperationsInAnyDiscoveredSwagger_ReturnsOkWithMessage()
+    {
+        // Arrange
+        var request = new SwaggerControllerScanRequest { SwaggerUiUrl = "http://valid-ui-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
+        var jsonUrls = new List<string> { "http://empty1.com/swagger.json", "http://empty2.com/swagger.json" };
+        
+        _mockDatabaseService.Setup(db => db.GetOrCreateGroupAsync(request.GroupName)).ReturnsAsync(1);
+        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(request.ServiceName, request.SwaggerUiUrl, 1)).ReturnsAsync(101);
+        _mockSwaggerService.Setup(s => s.DiscoverSwaggerJsonUrlsAsync(request.SwaggerUiUrl)).ReturnsAsync(jsonUrls);
+
+        var emptyDoc = new OpenApiDocument(); // Empty document
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[0])).ReturnsAsync(emptyDoc);
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[1])).ReturnsAsync(emptyDoc);
+        
+        // Act
+        var result = await _controller.Scan(request);
+
+        // Assert
+        var okResult = Assert.IsType<OkObjectResult>(result);
+        Assert.Equal($"No operations with descriptions found across all {jsonUrls.Count} discovered Swagger document(s).", ((dynamic)okResult.Value).message);
     }
     
     [Fact]
-    public async Task Scan_ValidRequest_ProcessesOperationsCorrectly()
+    public async Task Scan_ValidRequest_MultipleJsonUrls_ProcessesOperationsCorrectly()
     {
         // Arrange
-        var request = new SwaggerControllerScanRequest { Url = "http://valid-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
-        
-        var swaggerDoc = new OpenApiDocument
-        {
-            Paths = new OpenApiPaths
-            {
-                ["/items"] = new OpenApiPathItem
-                {
-                    Operations = new Dictionary<OperationType, OpenApiOperation>
-                    {
-                        [OperationType.Get] = new OpenApiOperation { Description = "Get all items" },
-                        [OperationType.Post] = new OpenApiOperation { Description = "Create an item" }
-                    }
-                },
-                ["/items/{id}"] = new OpenApiPathItem
-                {
-                    Operations = new Dictionary<OperationType, OpenApiOperation>
-                    {
-                        [OperationType.Get] = new OpenApiOperation { Description = "Get item by ID" },
-                        [OperationType.Put] = new OpenApiOperation { /* No description */ }
-                    }
-                }
-            }
-        };
+        var request = new SwaggerControllerScanRequest { SwaggerUiUrl = "http://valid-ui-url.com", GroupName = "TestGroup", ServiceName = "TestService" };
+        var jsonUrls = new List<string> { "http://site1.com/api.json", "http://site2.com/spec.json" };
 
-        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(request.Url)).ReturnsAsync(swaggerDoc);
         _mockDatabaseService.Setup(db => db.GetOrCreateGroupAsync(request.GroupName)).ReturnsAsync(1);
-        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(request.ServiceName, request.Url, 1)).ReturnsAsync(101);
+        _mockDatabaseService.Setup(db => db.GetOrCreateServiceAsync(request.ServiceName, request.SwaggerUiUrl, 1)).ReturnsAsync(101);
+        _mockSwaggerService.Setup(s => s.DiscoverSwaggerJsonUrlsAsync(request.SwaggerUiUrl)).ReturnsAsync(jsonUrls);
 
-        var expectedDescriptions = new[] { "Get all items", "Create an item", "Get item by ID" };
-        var embeddingsDict = expectedDescriptions.ToDictionary(
-            desc => desc, 
-            desc => new[] { 0.1f, 0.2f } // Dummy embedding
-        );
-        _mockEmbeddingService.Setup(e => e.BulkConversion(It.Is<string[]>(descs => descs.SequenceEqual(expectedDescriptions))))
-            .ReturnsAsync(embeddingsDict);
+        var doc1 = new OpenApiDocument { Paths = new OpenApiPaths { ["/items"] = new OpenApiPathItem { Operations = new Dictionary<OperationType, OpenApiOperation> { [OperationType.Get] = new OpenApiOperation { Description = "Get all items" } } } } };
+        var doc2 = new OpenApiDocument { Paths = new OpenApiPaths { ["/products"] = new OpenApiPathItem { Operations = new Dictionary<OperationType, OpenApiOperation> { [OperationType.Post] = new OpenApiOperation { Description = "Create a product" } } } } };
+        
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[0])).ReturnsAsync(doc1);
+        _mockSwaggerService.Setup(s => s.GetSwaggerDocumentAsync(jsonUrls[1])).ReturnsAsync(doc2);
+
+        var expectedDescriptions = new[] { "Get all items", "Create a product" };
+        var embeddingsDict = expectedDescriptions.ToDictionary(desc => desc, desc => new[] { 0.1f, 0.2f });
+        _mockEmbeddingService.Setup(e => e.BulkConversion(It.Is<string[]>(descs => descs.SequenceEqual(expectedDescriptions)))).ReturnsAsync(embeddingsDict);
 
         List<Document> capturedDocuments = null;
         _mockDatabaseService.Setup(db => db.BulkInsertAsync(It.IsAny<IEnumerable<Document>>(), 101, It.IsAny<CancellationToken>()))
@@ -142,15 +167,14 @@ public class SwaggerControllerTests
         var result = await _controller.Scan(request);
 
         // Assert
-        Assert.IsType<OkObjectResult>(result);
-        _mockDatabaseService.Verify(db => db.BulkInsertAsync(It.IsAny<IEnumerable<Document>>(), 101, It.IsAny<CancellationToken>()), Times.Once);
+        var okResult = Assert.IsType<OkObjectResult>(result);
+         Assert.Contains($"Data scanned and saved successfully from {jsonUrls.Count} Swagger definition(s). Processed {expectedDescriptions.Length} operations.", ((dynamic)okResult.Value).message);
         
+        _mockDatabaseService.Verify(db => db.BulkInsertAsync(It.IsAny<IEnumerable<Document>>(), 101, It.IsAny<CancellationToken>()), Times.Once);
         Assert.NotNull(capturedDocuments);
-        Assert.Equal(3, capturedDocuments.Count);
-
+        Assert.Equal(2, capturedDocuments.Count);
         Assert.Contains(capturedDocuments, d => d.Path == "GET /items" && d.Description == "Get all items");
-        Assert.Contains(capturedDocuments, d => d.Path == "POST /items" && d.Description == "Create an item");
-        Assert.Contains(capturedDocuments, d => d.Path == "GET /items/{id}" && d.Description == "Get item by ID");
+        Assert.Contains(capturedDocuments, d => d.Path == "POST /products" && d.Description == "Create a product");
         Assert.All(capturedDocuments, d => Assert.NotEmpty(d.Embedding));
     }
 

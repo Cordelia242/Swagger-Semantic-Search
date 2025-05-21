@@ -18,21 +18,40 @@ public class PgDatabaseService : IDatabaseService
 
     public async IAsyncEnumerable<Document> SearchByDescriptionAsync(
         float[] descriptionEmbedding,
-        int limit = 5
+        int serviceId,
+        int limit = 5,
+        int? groupId = null
     )
     {
         await using var connection = await dataSource.OpenConnectionAsync();
-        var query =
-            @"
+        var query = @"
             SELECT sd.description, sd.path 
             FROM swagger_data sd";
+        
+        if (groupId.HasValue)
+        {
+            query += " JOIN swagger_services s ON sd.service_id = s.id";
+        }
 
+        query += " WHERE sd.service_id = @serviceId";
+
+        if (groupId.HasValue)
+        {
+            query += " AND s.group_id = @groupId";
+        }
+        
         query += " ORDER BY sd.embedding <-> @embedding LIMIT @limit";
 
         await using var cmd = new NpgsqlCommand(query, connection);
 
         cmd.Parameters.AddWithValue("embedding", new Vector(descriptionEmbedding));
+        cmd.Parameters.AddWithValue("serviceId", serviceId);
         cmd.Parameters.AddWithValue("limit", limit);
+
+        if (groupId.HasValue)
+        {
+            cmd.Parameters.AddWithValue("groupId", groupId.Value);
+        }
 
         await using var reader = await cmd.ExecuteReaderAsync();
 
@@ -104,13 +123,11 @@ public class PgDatabaseService : IDatabaseService
         {
             await cmd.ExecuteNonQueryAsync();
         }
-
+        
         // Alter swagger_services table to add group_id if it doesn't exist (safer for existing dbs)
         // This is a common pattern; exact syntax might vary or need to be split into multiple commands
         // depending on PostgreSQL version and existing constraints.
-        await using (
-            var cmd = new NpgsqlCommand(
-                @"
+        await using (var cmd = new NpgsqlCommand(@"
             DO $$
             BEGIN
                 IF NOT EXISTS (
@@ -121,13 +138,11 @@ public class PgDatabaseService : IDatabaseService
                     ADD COLUMN group_id INT,
                     ADD CONSTRAINT fk_group FOREIGN KEY (group_id) REFERENCES service_groups(id);
                 END IF;
-            END$$;",
-                conn
-            )
-        )
+            END$$;", conn))
         {
             await cmd.ExecuteNonQueryAsync();
         }
+
 
         await using (
             var cmd = new NpgsqlCommand(
@@ -187,9 +202,7 @@ public class PgDatabaseService : IDatabaseService
     {
         await using var connection = await dataSource.OpenConnectionAsync();
         // Check if group exists
-        await using (
-            var cmd = new NpgsqlCommand("SELECT id FROM service_groups WHERE name = $1", connection)
-        )
+        await using (var cmd = new NpgsqlCommand("SELECT id FROM service_groups WHERE name = $1", connection))
         {
             cmd.Parameters.AddWithValue(groupName);
             var groupId = await cmd.ExecuteScalarAsync();
@@ -200,35 +213,18 @@ public class PgDatabaseService : IDatabaseService
         }
 
         // Create group if not exists
-        await using (
-            var cmd = new NpgsqlCommand(
-                "INSERT INTO service_groups (name) VALUES ($1) RETURNING id",
-                connection
-            )
-        )
+        await using (var cmd = new NpgsqlCommand("INSERT INTO service_groups (name) VALUES ($1) RETURNING id", connection))
         {
             cmd.Parameters.AddWithValue(groupName);
-            return (int)(
-                await cmd.ExecuteScalarAsync()
-                ?? throw new InvalidOperationException("Failed to create group.")
-            );
+            return (int)(await cmd.ExecuteScalarAsync() ?? throw new InvalidOperationException("Failed to create group."));
         }
     }
 
-    public async Task<int> GetOrCreateServiceAsync(
-        string serviceName,
-        string serviceUrl,
-        int groupId
-    )
+    public async Task<int> GetOrCreateServiceAsync(string serviceName, string serviceUrl, int groupId)
     {
         await using var connection = await dataSource.OpenConnectionAsync();
         // Check if service exists
-        await using (
-            var cmd = new NpgsqlCommand(
-                "SELECT id FROM swagger_services WHERE name = $1 AND group_id = $2",
-                connection
-            )
-        )
+        await using (var cmd = new NpgsqlCommand("SELECT id FROM swagger_services WHERE name = $1 AND group_id = $2", connection))
         {
             cmd.Parameters.AddWithValue(serviceName);
             cmd.Parameters.AddWithValue(groupId);
@@ -236,12 +232,7 @@ public class PgDatabaseService : IDatabaseService
             if (serviceId != null)
             {
                 // Update URL if service exists
-                await using (
-                    var updateCmd = new NpgsqlCommand(
-                        "UPDATE swagger_services SET url = $1 WHERE id = $2",
-                        connection
-                    )
-                )
+                await using (var updateCmd = new NpgsqlCommand("UPDATE swagger_services SET url = $1 WHERE id = $2", connection))
                 {
                     updateCmd.Parameters.AddWithValue(serviceUrl);
                     updateCmd.Parameters.AddWithValue((int)serviceId);
@@ -252,30 +243,19 @@ public class PgDatabaseService : IDatabaseService
         }
 
         // Create service if not exists
-        await using (
-            var cmd = new NpgsqlCommand(
-                "INSERT INTO swagger_services (name, url, group_id) VALUES ($1, $2, $3) RETURNING id",
-                connection
-            )
-        )
+        await using (var cmd = new NpgsqlCommand("INSERT INTO swagger_services (name, url, group_id) VALUES ($1, $2, $3) RETURNING id", connection))
         {
             cmd.Parameters.AddWithValue(serviceName);
             cmd.Parameters.AddWithValue(serviceUrl);
             cmd.Parameters.AddWithValue(groupId);
-            return (int)(
-                await cmd.ExecuteScalarAsync()
-                ?? throw new InvalidOperationException("Failed to create service.")
-            );
+            return (int)(await cmd.ExecuteScalarAsync() ?? throw new InvalidOperationException("Failed to create service."));
         }
     }
 
     public async Task<int?> GetGroupIdByNameAsync(string groupName)
     {
         await using var connection = await dataSource.OpenConnectionAsync();
-        await using var cmd = new NpgsqlCommand(
-            "SELECT id FROM service_groups WHERE name = $1",
-            connection
-        );
+        await using var cmd = new NpgsqlCommand("SELECT id FROM service_groups WHERE name = $1", connection);
         cmd.Parameters.AddWithValue(groupName);
         var groupId = await cmd.ExecuteScalarAsync();
         if (groupId != null)
